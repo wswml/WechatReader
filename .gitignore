@@ -1,0 +1,12 @@
+.gradle/
+build/
+*.apk
+*.zip
+.idea/
+*.iml
+local.properties
+accounts.py
+accounts.db
+export_*.csv
+wechat-reader
+__pycache__/
