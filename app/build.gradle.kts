@@ -4,7 +4,8 @@ plugins {
 
 android {
     namespace = "com.nous.wechatreader"
-    compileSdk = 34
+    compileSdk = 36
+    buildToolsVersion = "36.1.0"
 
     defaultConfig {
         applicationId = "com.nous.wechatreader"
