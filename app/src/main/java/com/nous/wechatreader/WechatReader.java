@@ -1,6 +1,7 @@
 package com.nous.wechatreader;
 
 import android.content.ContentValues;
+import android.content.Context;
 import android.database.sqlite.SQLiteDatabase;
 import android.util.Log;
 
@@ -26,6 +27,7 @@ public class WechatReader implements IXposedHookLoadPackage {
     private static final String TAG = "WechatReader";
     private static String sApp = null;
     private static boolean sActive = false;
+    private static Context sContext = null;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -43,16 +45,14 @@ public class WechatReader implements IXposedHookLoadPackage {
 
         Log.i(TAG, "模块加载: " + sApp + " / " + lpparam.processName);
         hookSQLite(lpparam.classLoader);
-        scheduleDailyAlarm(lpparam);
+        if ("wechat".equals(sApp)) {
+            triggerInitialExport(lpparam);
+        }
         Log.i(TAG, "SQLite hook 注册完成");
     }
 
-    /**
-     * Hook Application.onCreate 获取 Context 后调度闹钟。
-     * handleLoadPackage 阶段 Application 可能还未创建，getApplication() 返回 null，
-     * 所以通过 hook Application 生命周期来获取可靠 Context。
-     */
-    private void scheduleDailyAlarm(XC_LoadPackage.LoadPackageParam lpparam) {
+    /** 模块首次加载时触发一次导出，让用户立即看到成果 */
+    private void triggerInitialExport(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
             XposedHelpers.findAndHookMethod(
                     "android.app.Application",
@@ -62,12 +62,13 @@ public class WechatReader implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             android.content.Context ctx = (android.content.Context) param.thisObject;
-                            DailyExportReceiver.scheduleDailyAlarm(ctx);
-                            Log.i(TAG, "闹钟已通过 Application.onCreate 成功调度");
+                            sContext = ctx.getApplicationContext();
+                            DailyExportReceiver.triggerExportNow(ctx);
+                            Log.i(TAG, "已触发即时导出");
                         }
                     });
         } catch (Throwable e) {
-            Log.w(TAG, "钩住 Application.onCreate 失败: " + e.getMessage());
+            Log.w(TAG, "触发导出失败: " + e.getMessage());
         }
     }
 
@@ -157,7 +158,6 @@ public class WechatReader implements IXposedHookLoadPackage {
                 if ("wechat".equals(sApp) && "message".equals(table)) {
                     line = formatWechat(cv);
                     if (line == null) {
-                        // 调试: 记录为何被跳过
                         Integer type = cv.getAsInteger("type");
                         String content = cv.getAsString("content");
                         byte[] blob = cv.getAsByteArray("content");
@@ -177,8 +177,17 @@ public class WechatReader implements IXposedHookLoadPackage {
 
                 if (line != null) {
                     markActive();
-                    long ts = getTs(cv);
+                    long ts = System.currentTimeMillis();
                     MessageWriter.write(line, ts);
+                    // 捕获到微信支付消息时立即触发导出
+                    if ("wechat".equals(sApp) && sContext != null
+                            && (line.contains("|红包|") || line.contains("|转账|")
+                              || line.contains("other:318767153"))) {
+                        new Thread(() -> {
+                            try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
+                            DailyExportReceiver.triggerExportNow(sContext);
+                        }).start();
+                    }
                 }
             } catch (Throwable ignored) {}
         }
@@ -204,7 +213,7 @@ public class WechatReader implements IXposedHookLoadPackage {
                 String line = "U|" + formatWechat(cv);
                 if (line != null) {
                     markActive();
-                    long ts = getTs(cv);
+                    long ts = System.currentTimeMillis();
                     MessageWriter.write(line, ts);
                 }
             } catch (Throwable ignored) {}
@@ -316,18 +325,6 @@ public class WechatReader implements IXposedHookLoadPackage {
     }
 
     // ── 工具方法 ──────────────────────────────────────────
-
-    static long getTs(ContentValues cv) {
-        Long ts = cv.getAsLong("createTime");
-        if (ts != null) return ts * 1000;
-        ts = cv.getAsLong("gmtCreate");
-        if (ts != null) return ts;
-        ts = cv.getAsLong("localTime");
-        if (ts != null) return ts;
-        ts = cv.getAsLong("bTime");
-        if (ts != null) return ts;
-        return System.currentTimeMillis();
-    }
 
     /** 去掉换行和管道符，防止破坏输出格式 */
     static String sanitize(String s) {

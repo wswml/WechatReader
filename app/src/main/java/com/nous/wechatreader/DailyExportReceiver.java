@@ -56,12 +56,15 @@ public class DailyExportReceiver extends BroadcastReceiver {
 
     // Alipay:  A|支出|20.00|商户|方法
     // WeChat:  W|收到|类型|talker|body
+    // Update:  U|W|方向|类型|talker|body（红包开奖后金额更新）
     private static final Pattern ALIPAY_RE =
             Pattern.compile("A\\|(支出|收入)\\|([\\d.]+)\\|([^|]*)\\|([^|]*)");
     private static final Pattern WECHAT_RE =
             Pattern.compile("W\\|(收到|发出)\\|([^|]+)\\|(?:[^|]*\\|)?(.*)");
+    private static final Pattern UPDATE_RE =
+            Pattern.compile("U\\|W\\|(收到|发出)\\|([^|]+)\\|[^|]*\\|(.*)");
     private static final Pattern AMOUNT_RE =
-            Pattern.compile("[¥￥]\\s*([\\d,]+\\\\.?\\\\d*)");
+            Pattern.compile("[¥￥]\\s*([\\d,]+\\.?\\d*)");
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -81,6 +84,8 @@ public class DailyExportReceiver extends BroadcastReceiver {
                 try {
                     doExport(context);
                 } finally {
+                    // 导出完成后重新调度闹钟（使用模块自身 Context，不依赖微信进程）
+                    scheduleDailyAlarm(context);
                     pending.finish();
                 }
             }).start();
@@ -99,34 +104,48 @@ public class DailyExportReceiver extends BroadcastReceiver {
                 context, 0, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        // 每天凌晨2点触发
+        // 每小时触发
         Calendar cal = Calendar.getInstance();
-        cal.set(Calendar.HOUR_OF_DAY, 2);
         cal.set(Calendar.MINUTE, 0);
         cal.set(Calendar.SECOND, 0);
+        cal.add(Calendar.HOUR_OF_DAY, 1);
         if (cal.before(Calendar.getInstance())) {
-            cal.add(Calendar.DAY_OF_MONTH, 1);
+            cal.add(Calendar.HOUR_OF_DAY, 1);
         }
 
         am.setInexactRepeating(
                 AlarmManager.RTC_WAKEUP,
                 cal.getTimeInMillis(),
-                AlarmManager.INTERVAL_DAY,
+                AlarmManager.INTERVAL_HOUR,
                 pi);
 
-        Log.i(TAG, "每日闹钟已设置: 凌晨2:00");
+        Log.i(TAG, "闹钟已设置: 每整点");
+    }
+
+    /** 由 WechatReader 模块加载时调用，直接执行导出（不走广播） */
+    public static void triggerExportNow(Context context) {
+        new Thread(() -> {
+            try {
+                DailyExportReceiver receiver = new DailyExportReceiver();
+                receiver.createChannel(context);
+                receiver.doExport(context);
+            } catch (Exception e) {
+                Log.e(TAG, "即时导出失败: " + e.getMessage());
+            }
+        }).start();
     }
 
     // ── 支付宝轮询（通过 su 复制 DB → Java SQLite 读取）────
 
     private void pollAlipay() {
         try {
-            // 1. su 复制数据库到可读位置
-            Process p = Runtime.getRuntime().exec(new String[]{
-                    "su", "-c",
-                    "cp " + ALIPAY_DB + " " + ALIPAY_TMP
-                    + " && chmod 644 " + ALIPAY_TMP
-            });
+            // 1. su 复制数据库到可读位置（通过 shell 查找 su）
+            ProcessBuilder pb = new ProcessBuilder(
+                    "/system/bin/sh", "-c",
+                    "su -c 'cp " + ALIPAY_DB + " " + ALIPAY_TMP
+                    + " && chmod 644 " + ALIPAY_TMP + "'"
+            );
+            Process p = pb.start();
             p.waitFor();
             if (p.exitValue() != 0) {
                 Log.w(TAG, "支付宝 DB 复制失败");
@@ -340,11 +359,13 @@ public class DailyExportReceiver extends BroadcastReceiver {
                     String note;
 
                     if (type.startsWith("other:")) {
-                        // 微信支付凭证 — 从 XML 提取收款方
+                        // 仅处理微信支付凭证 (318767153)，过滤公众号文章等含¥的非支付消息
+                        if (!type.contains("318767153")) continue;
+                        // 支付凭证：收到凭证 = 钱花出去了
+                        dir = "支出";
                         String merchant = extractXmlTag(content, "收款方");
                         if (merchant.isEmpty()) {
                             merchant = extractXmlCdata(content, "des");
-                            // 截取关键部分
                             if (merchant.length() > 30) {
                                 merchant = merchant.substring(0, 30);
                             }
@@ -361,6 +382,42 @@ public class DailyExportReceiver extends BroadcastReceiver {
                         cat = type;
                         note = "微信" + type;
                     }
+
+                    SimpleDateFormat df = new SimpleDateFormat(
+                            "yyyy/M/d HH:mm", Locale.getDefault());
+                    String timeFmt = df.format(new Date(ts));
+
+                    csv.append(timeFmt).append(",")
+                       .append(cat).append(",,")
+                       .append(dir).append(",")
+                       .append(amount).append(",")
+                       .append(",,").append(note).append(",,,,,\n");
+
+                    count++;
+                    total += amount;
+                }
+
+                // ── 更新状态（红包开奖等带金额的 U| 行）──
+                Matcher um = UPDATE_RE.matcher(data);
+                if (um.matches()) {
+                    String dirRaw = um.group(1);
+                    String type = um.group(2);
+                    String content = um.group(3);
+
+                    double amount = 0;
+                    Matcher amtM = AMOUNT_RE.matcher(content);
+                    if (amtM.find()) {
+                        try {
+                            amount = Double.parseDouble(
+                                    amtM.group(1).replace(",", ""));
+                        } catch (NumberFormatException e) { continue; }
+                    } else {
+                        continue;
+                    }
+
+                    String dir = "收到".equals(dirRaw) ? "收入" : "支出";
+                    String cat = "红包".equals(type) ? "红包" : "转账";
+                    String note = "红包".equals(type) ? "微信红包" : "微信转账";
 
                     SimpleDateFormat df = new SimpleDateFormat(
                             "yyyy/M/d HH:mm", Locale.getDefault());
@@ -408,6 +465,13 @@ public class DailyExportReceiver extends BroadcastReceiver {
 
         // 通知
         notifySuccess(context, count, total);
+
+        // 增量上传原始日志到服务器(方案A: 服务器端解析入库)
+        try {
+            RawLogUploader.uploadIncremental();
+        } catch (Exception e) {
+            Log.w(TAG, "上传触发失败: " + e.getMessage());
+        }
     }
 
     // ── XML / 文本解析辅助 ──────────────────────────────
